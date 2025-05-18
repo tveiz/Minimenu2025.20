@@ -1,11 +1,269 @@
-local armaDesejada = "AK DRAGON" -- Nome da arma exato
-local player = game.Players.LocalPlayer
-local armas = player["."] -- Onde estão suas armas
-local humanoid = player.Character:FindFirstChildOfClass("Humanoid")
+"""
+Discord Bot de Vendas – Slash Commands centralizados em /menu
+=============================================================
+• Framework: discord.py v2.4 (application-commands nativos)
+• Persistência: TinyDB (JSON local) – fácil trocar por SQLite/MySQL.
+---------------------------------------------------------------
+/menu config cargos … | pagamento … | timeout …
+/menu criar nome:<menu>
+/menu abrir nome:<menu>
+/menu fechar nome:<menu>
+/menu deletar nome:<menu>
+/menu produto adicionar|editar|remover …
+/menu estoque ver|set …
+(embeds geram botão 🛒; /menu comprar produto:<produto> é atalho)
+"""
 
-for _, arma in pairs(armas:GetChildren()) do
-    if arma:IsA("Tool") and arma.Name == armaDesejada then
-        humanoid:EquipTool(arma)
-        break
-    end
-end
+import os, asyncio
+from typing import Optional
+from datetime import datetime, timedelta
+
+import discord
+from discord import app_commands, Interaction, Embed, ButtonStyle, PermissionOverwrite
+from discord.ext import commands, tasks
+from tinydb import TinyDB, Query
+
+TOKEN = os.getenv("DISCORD_TOKEN")            # coloque seu token no env
+INTENTS = discord.Intents.default()
+INTENTS.message_content = False               # só slash
+
+db        = TinyDB("menus.json")
+menus_tb  = db.table("menus")                 # {guild, name, channel_id, products, settings}
+
+# ─────────────────── PERSISTÊNCIA ──────────────────────────────────
+def get_menu(guild_id: int, name: str):
+    Menu = Query()
+    return menus_tb.get((Menu.guild == guild_id) & (Menu.name == name.lower()))
+
+def upsert_menu(data: dict):
+    Menu = Query()
+    menus_tb.upsert(data, (Menu.guild == data["guild"]) & (Menu.name == data["name"]))
+
+# ─────────────────── VIEW CARRINHO ─────────────────────────────────
+class CarrinhoView(discord.ui.View):
+    def __init__(self, menu: dict, produto: dict, comprador_id: int, timeout_min: int):
+        super().__init__(timeout=timeout_min * 60)
+        self.menu = menu
+        self.produto = produto
+        self.comprador_id = comprador_id
+
+    async def interaction_check(self, interaction: Interaction) -> bool:
+        return interaction.user.id == self.comprador_id
+
+    @discord.ui.button(label="💳 Pagar", style=ButtonStyle.green)
+    async def pagar(self, interaction: Interaction, _):
+        self.produto["estoque"] -= 1
+        upsert_menu(self.menu)
+        await interaction.response.send_message(
+            f"Pagamento confirmado para **{self.produto['nome']}**. Obrigado!",
+            ephemeral=True,
+        )
+        await interaction.message.channel.delete(delay=5)
+        self.stop()
+
+    @discord.ui.button(label="❌ Cancelar", style=ButtonStyle.red)
+    async def cancelar(self, interaction: Interaction, _):
+        await interaction.response.send_message("Compra cancelada.", ephemeral=True)
+        await interaction.message.channel.delete(delay=2)
+        self.stop()
+
+# ─────────────────── BOT ──────────────────────────────────────────
+bot = commands.Bot(command_prefix="!", intents=INTENTS)
+
+def admin_check():
+    async def predicate(inter: Interaction):
+        return inter.user.guild_permissions.manage_guild
+    return app_commands.check(predicate)
+
+class MenuCog(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        self.carrinho_cleaner.start()
+
+    # grupo raiz
+    menu = app_commands.Group(name="menu", description="Gerencia catálogos de vendas")
+
+    # ─── CONFIG ──────────────────────────────────────────────
+    config = app_commands.Group(parent=menu, name="config",
+                                description="Configurações do menu")
+
+    @config.command(name="cargos", description="Define cargos de moderação e clientes")
+    @admin_check()
+    async def config_cargos(self, inter: Interaction,
+                            mod_role: discord.Role,
+                            client_role: Optional[discord.Role] = None):
+        guild_id = inter.guild.id
+        data = menus_tb.get(Query().guild == guild_id) or {"guild": guild_id}
+        data.setdefault("settings", {})
+        data["settings"].update({
+            "mod_role": mod_role.id,
+            "client_role": client_role.id if client_role else None
+        })
+        upsert_menu(data)
+        await inter.response.send_message("Cargos configurados!", ephemeral=True)
+
+    @config.command(name="timeout", description="Define timeout do carrinho (min)")
+    @admin_check()
+    async def config_timeout(self, inter: Interaction, minutos: int):
+        g = inter.guild.id
+        data = menus_tb.get(Query().guild == g) or {"guild": g}
+        data.setdefault("settings", {})["timeout"] = minutos
+        upsert_menu(data)
+        await inter.response.send_message(f"Timeout definido: {minutos} min.", ephemeral=True)
+
+    # ─── CRUD MENU ───────────────────────────────────────────
+    @menu.command(name="criar", description="Cria um novo menu")
+    async def criar(self, inter: Interaction, nome: str):
+        await inter.response.defer(ephemeral=True)
+        guild = inter.guild
+        nome = nome.lower()
+
+        if get_menu(guild.id, nome):
+            await inter.followup.send("Já existe menu com esse nome.")
+            return
+
+        overwrites = {
+            guild.default_role: PermissionOverwrite(view_channel=False),
+            guild.me: PermissionOverwrite(view_channel=True, manage_channels=True)
+        }
+        channel = await guild.create_text_channel(f"menu-{nome}", overwrites=overwrites)
+        upsert_menu({
+            "guild": guild.id, "name": nome,
+            "channel_id": channel.id, "products": [], "settings": {}
+        })
+        await inter.followup.send(f"Menu **{nome}** criado em {channel.mention}.")
+
+    @menu.command(name="abrir", description="Abre menu ao público")
+    async def abrir(self, inter: Interaction, nome: str):
+        m = get_menu(inter.guild.id, nome)
+        if not m:
+            await inter.response.send_message("Menu não encontrado.", ephemeral=True); return
+        channel = inter.guild.get_channel(m["channel_id"])
+        role_id = m.get("settings", {}).get("client_role")
+        role = inter.guild.get_role(role_id) if role_id else inter.guild.default_role
+        await channel.set_permissions(role, view_channel=True)
+        await inter.response.send_message(f"Menu {nome} aberto para {role.name}.", ephemeral=True)
+
+    @menu.command(name="fechar", description="Fecha menu")
+    async def fechar(self, inter: Interaction, nome: str):
+        m = get_menu(inter.guild.id, nome)
+        if not m:
+            await inter.response.send_message("Menu não encontrado.", ephemeral=True); return
+        channel = inter.guild.get_channel(m["channel_id"])
+        await channel.set_permissions(inter.guild.default_role, view_channel=False)
+        await inter.response.send_message("Menu fechado.", ephemeral=True)
+
+    @menu.command(name="deletar", description="Exclui menu")
+    async def deletar(self, inter: Interaction, nome: str):
+        m = get_menu(inter.guild.id, nome)
+        if not m:
+            await inter.response.send_message("Menu não existe.", ephemeral=True); return
+        channel = inter.guild.get_channel(m["channel_id"])
+        await channel.delete(reason="Menu deletado")
+        menus_tb.remove((Query().guild == inter.guild.id) & (Query().name == nome.lower()))
+        await inter.response.send_message("Menu deletado.", ephemeral=True)
+
+    # ─── PRODUTO ─────────────────────────────────────────────
+    produto = app_commands.Group(parent=menu, name="produto",
+                                 description="Gerencia produtos")
+
+    @produto.command(name="adicionar", description="Adiciona produto")
+    async def prod_add(self, inter: Interaction, menu: str, nome: str,
+                       preco: float, estoque: Optional[int] = 0,
+                       descricao: Optional[str] = None):
+        data = get_menu(inter.guild.id, menu)
+        if not data:
+            await inter.response.send_message("Menu não encontrado.", ephemeral=True); return
+
+        produto = {"nome": nome, "preco": preco,
+                   "estoque": estoque, "descricao": descricao or "Sem descrição."}
+        data["products"].append(produto)
+        upsert_menu(data)
+
+        embed = Embed(title=nome, description=produto["descricao"], colour=0x2ecc71)
+        embed.add_field(name="Preço", value=f"R$ {preco:.2f}")
+        embed.add_field(name="Estoque", value=str(estoque))
+        view = discord.ui.View()
+        view.add_item(
+            discord.ui.Button(label="🛒 Comprar", style=ButtonStyle.primary,
+                              custom_id=f"buy:{menu}:{nome}")
+        )
+        await inter.guild.get_channel(data["channel_id"]).send(embed=embed, view=view)
+        await inter.response.send_message("Produto adicionado.", ephemeral=True)
+
+    # ─── ESTOQUE ─────────────────────────────────────────────
+    estoque = app_commands.Group(parent=menu, name="estoque",
+                                 description="Consulta ou ajusta estoque")
+
+    @estoque.command(name="ver", description="Mostra estoque")
+    async def est_ver(self, inter: Interaction, menu: str):
+        data = get_menu(inter.guild.id, menu)
+        if not data:
+            await inter.response.send_message("Menu não existe.", ephemeral=True); return
+        text = "\n".join(f"**{p['nome']}** — {p['estoque']} un." for p in data["products"]) \
+               or "Sem produtos."
+        await inter.response.send_message(text, ephemeral=True)
+
+    @estoque.command(name="set", description="Altera estoque")
+    async def est_set(self, inter: Interaction, menu: str,
+                      produto: str, quantidade: int):
+        data = get_menu(inter.guild.id, menu)
+        if not data:
+            await inter.response.send_message("Menu não encontrado.", ephemeral=True); return
+        for p in data["products"]:
+            if p["nome"].lower() == produto.lower():
+                p["estoque"] = quantidade
+                upsert_menu(data)
+                await inter.response.send_message("Estoque atualizado.", ephemeral=True)
+                return
+        await inter.response.send_message("Produto não encontrado.", ephemeral=True)
+
+    # ─── BOTÕES DE COMPRA ────────────────────────────────────
+    @commands.Cog.listener()
+    async def on_interaction(self, inter: Interaction):
+        if inter.type != discord.InteractionType.component: return
+        cid = inter.data.get("custom_id", "")
+        if not cid.startswith("buy:"): return
+
+        _, menu_name, prod_name = cid.split(":")
+        menu = get_menu(inter.guild.id, menu_name)
+        if not menu:
+            await inter.response.send_message("Menu não encontrado.", ephemeral=True); return
+        produto = next((p for p in menu["products"] if p["nome"] == prod_name), None)
+        if not produto or produto["estoque"] <= 0:
+            await inter.response.send_message("Produto fora de estoque.", ephemeral=True); return
+
+        timeout = menu.get("settings", {}).get("timeout", 30)
+        overwrites = {
+            inter.guild.default_role: PermissionOverwrite(view_channel=False),
+            inter.user: PermissionOverwrite(view_channel=True),
+            inter.guild.me: PermissionOverwrite(view_channel=True),
+        }
+        cart = await inter.guild.create_text_channel(
+            f"carrinho-{inter.user.id}-{int(datetime.utcnow().timestamp())}", overwrites=overwrites
+        )
+        view = CarrinhoView(menu, produto, inter.user.id, timeout)
+        await cart.send(
+            f"{inter.user.mention}, comprando **{produto['nome']}** por R$ {produto['preco']:.2f}",
+            view=view,
+        )
+        await inter.response.send_message(f"Carrinho criado em {cart.mention}", ephemeral=True)
+
+    # ─── LIMPEZA AUTO ────────────────────────────────────────
+    @tasks.loop(minutes=10)
+    async def carrinho_cleaner(self):
+        for guild in self.bot.guilds:
+            for ch in guild.text_channels:
+                if not ch.name.startswith("carrinho-"): continue
+                last = ch.last_message
+                if last and datetime.utcnow() - last.created_at > timedelta(minutes=60):
+                    await ch.delete(reason="Carrinho timeout")
+
+# ─────────────────── EXECUÇÃO ────────────────────────────────────
+async def main():
+    await bot.add_cog(MenuCog(bot))
+    await bot.tree.sync()  # registra slash commands
+    bot.run(TOKEN)
+
+if __name__ == "__main__":
+    asyncio.run(main())
